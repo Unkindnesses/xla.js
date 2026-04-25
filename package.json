@@ -1,0 +1,23 @@
+{
+  "name": "xla.js",
+  "version": "0.1.0",
+  "description": "TypeScript/Node wrapper for the PJRT C API",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "node-gyp rebuild && tsc",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "clean": "node-gyp clean && rm -rf dist"
+  },
+  "files": [
+    "dist",
+    "build/Release/xla_js.node",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "node-gyp": "^12.1.0",
+    "typescript": "^5.9.3"
+  }
+}
