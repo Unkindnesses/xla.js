@@ -1,24 +1,35 @@
 # xla.js
 
-TypeScript/Node wrapper around the PJRT C API. The current implementation targets the PJRT CPU plugin built in the local OpenXLA checkout at `./xla`.
+TypeScript/Node wrapper around the PJRT C API. The current implementation targets the PJRT CPU plugin from a built OpenXLA checkout.
 
 ## Prerequisites
 
 - Node.js 25+
 - A C++17 compiler
-- A built PJRT CPU plugin at `xla/bazel-bin/xla/pjrt/c/pjrt_c_api_cpu_plugin.so`
+- A built OpenXLA checkout
+- A built PJRT CPU plugin at `$XLA_DIR/bazel-bin/xla/pjrt/c/pjrt_c_api_cpu_plugin.so`
 
-The repository expects `./xla` to point at an OpenXLA source/build tree. In this workspace it is a symlink to `/Users/mike/projects/xla`.
+Set `XLA_DIR` to the OpenXLA source/build tree before building or running the default CPU client:
+
+```sh
+export XLA_DIR=/path/to/openxla
+```
+
+The native addon uses `XLA_DIR` to find PJRT C API headers at build time. At runtime, `new Client()` loads the CPU plugin from `$XLA_DIR/bazel-bin/xla/pjrt/c/pjrt_c_api_cpu_plugin.so`.
+
+If the CPU plugin is somewhere else, pass `pluginPath` to `Client`.
 
 ## Install
 
 ```sh
+export XLA_DIR=/path/to/openxla
 npm install
 ```
 
 ## Build
 
 ```sh
+export XLA_DIR=/path/to/openxla
 npm run build
 ```
 
@@ -27,6 +38,7 @@ This runs `node-gyp rebuild` to compile the native Node addon, then `tsc` to com
 ## Test
 
 ```sh
+export XLA_DIR=/path/to/openxla
 npm test
 ```
 
@@ -51,7 +63,7 @@ const executable = client.compileMlir(mlir)
 console.log(await executable.executeF32Scalar(41)) // 42
 ```
 
-Pass a custom plugin path when the PJRT build is somewhere else:
+Pass a custom plugin path when the PJRT plugin is somewhere else:
 
 ```ts
 const client = new Client({
