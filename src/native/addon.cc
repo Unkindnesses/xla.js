@@ -25,6 +25,30 @@ struct ClientRef {
 struct ExecutableRef {
   ClientRef* client = nullptr;
   PJRT_LoadedExecutable* executable = nullptr;
+  napi_env env = nullptr;
+  napi_ref client_ref = nullptr;
+};
+
+enum class AsyncExecuteStep {
+  kStart,
+  kAfterInput,
+  kAfterExecute,
+  kAfterHostCopy,
+};
+
+struct AsyncExecuteRef {
+  napi_env env = nullptr;
+  napi_deferred deferred = nullptr;
+  napi_threadsafe_function ready = nullptr;
+  napi_ref executable_ref = nullptr;
+  ExecutableRef* executable = nullptr;
+  PJRT_Buffer* input = nullptr;
+  PJRT_Buffer* output = nullptr;
+  PJRT_Event* waiting_event = nullptr;
+  float input_value = NAN;
+  float result = NAN;
+  AsyncExecuteStep step = AsyncExecuteStep::kStart;
+  std::string error;
 };
 
 template <class T>
@@ -77,9 +101,7 @@ std::string SingleDeviceCompileOptions() {
   return std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes));
 }
 
-void CheckPjrt(napi_env env, const PJRT_Api* api, PJRT_Error* error) {
-  if (!error) return;
-
+std::string PjrtErrorMessage(const PJRT_Api* api, PJRT_Error* error) {
   PJRT_Error_Message_Args message_args{
       .struct_size = PJRT_Error_Message_Args_STRUCT_SIZE,
       .extension_start = nullptr,
@@ -94,7 +116,13 @@ void CheckPjrt(napi_env env, const PJRT_Api* api, PJRT_Error* error) {
       .error = error,
   };
   api->PJRT_Error_Destroy(&destroy_args);
-  Throw(env, message);
+  return message;
+}
+
+void CheckPjrt(napi_env env, const PJRT_Api* api, PJRT_Error* error) {
+  if (!error) return;
+
+  Throw(env, PjrtErrorMessage(api, error));
 }
 
 void DestroyEvent(const PJRT_Api* api, PJRT_Event* event) {
@@ -115,21 +143,6 @@ void DestroyBuffer(const PJRT_Api* api, PJRT_Buffer* buffer) {
       .buffer = buffer,
   };
   api->PJRT_Buffer_Destroy(&args);
-}
-
-PJRT_Device* FirstAddressableDevice(napi_env env, ClientRef* ref) {
-  PJRT_Client_AddressableDevices_Args args{
-      .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
-      .extension_start = nullptr,
-      .client = ref->client,
-  };
-  CheckPjrt(env, ref->library->api, ref->library->api->PJRT_Client_AddressableDevices(&args));
-  if (HasPendingException(env)) return nullptr;
-  if (args.num_addressable_devices == 0) {
-    Throw(env, "PJRT client has no addressable devices");
-    return nullptr;
-  }
-  return args.addressable_devices[0];
 }
 
 napi_value ExternalValue(napi_env env, void* data, napi_finalize finalizer) {
@@ -163,6 +176,7 @@ void FinalizeExecutable(napi_env, void* data, void*) {
     };
     ref->client->library->api->PJRT_LoadedExecutable_Destroy(&args);
   }
+  if (ref->client_ref) napi_delete_reference(ref->env, ref->client_ref);
   delete ref;
 }
 
@@ -283,19 +297,114 @@ napi_value Compile(napi_env env, napi_callback_info info) {
   CheckPjrt(env, client->library->api, client->library->api->PJRT_Client_Compile(&compile_args));
   if (HasPendingException(env) || !compile_args.executable) return nullptr;
 
-  auto* executable = new ExecutableRef{.client = client, .executable = compile_args.executable};
+  auto* executable = new ExecutableRef{
+      .client = client,
+      .executable = compile_args.executable,
+      .env = env,
+  };
+  napi_create_reference(env, args[0], 1, &executable->client_ref);
   return ExternalValue(env, executable, FinalizeExecutable);
 }
 
-PJRT_Buffer* BufferFromF32Scalar(napi_env env, ClientRef* ref, float value) {
-  PJRT_Device* device = FirstAddressableDevice(env, ref);
-  if (!device) return nullptr;
+const PJRT_Api* AsyncApi(AsyncExecuteRef* ref) {
+  return ref->executable->client->library->api;
+}
+
+void SetAsyncError(AsyncExecuteRef* ref, const std::string& message) {
+  if (ref->error.empty()) ref->error = message;
+}
+
+void SetAsyncPjrtError(AsyncExecuteRef* ref, PJRT_Error* error) {
+  if (!error) return;
+  SetAsyncError(ref, PjrtErrorMessage(AsyncApi(ref), error));
+}
+
+PJRT_Device* AsyncFirstAddressableDevice(AsyncExecuteRef* ref) {
+  auto* client = ref->executable->client;
+  PJRT_Client_AddressableDevices_Args args{
+      .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
+      .extension_start = nullptr,
+      .client = client->client,
+  };
+  SetAsyncPjrtError(ref, AsyncApi(ref)->PJRT_Client_AddressableDevices(&args));
+  if (!ref->error.empty()) return nullptr;
+  if (args.num_addressable_devices == 0) {
+    SetAsyncError(ref, "PJRT client has no addressable devices");
+    return nullptr;
+  }
+  return args.addressable_devices[0];
+}
+
+void CompleteAsyncExecute(AsyncExecuteRef* ref) {
+  auto api = AsyncApi(ref);
+  DestroyEvent(api, ref->waiting_event);
+  DestroyBuffer(api, ref->input);
+  DestroyBuffer(api, ref->output);
+  if (ref->executable_ref) napi_delete_reference(ref->env, ref->executable_ref);
+  if (ref->ready) napi_release_threadsafe_function(ref->ready, napi_tsfn_release);
+  delete ref;
+}
+
+void RejectAsyncExecute(AsyncExecuteRef* ref) {
+  napi_value message;
+  napi_value error;
+  napi_create_string_utf8(ref->env, ref->error.c_str(), ref->error.size(), &message);
+  napi_create_error(ref->env, nullptr, message, &error);
+  napi_reject_deferred(ref->env, ref->deferred, error);
+  CompleteAsyncExecute(ref);
+}
+
+void ResolveAsyncExecute(AsyncExecuteRef* ref) {
+  napi_value result;
+  napi_create_double(ref->env, ref->result, &result);
+  napi_resolve_deferred(ref->env, ref->deferred, result);
+  CompleteAsyncExecute(ref);
+}
+
+void ContinueAsyncExecute(AsyncExecuteRef* ref);
+
+void OnAsyncPjrtReady(PJRT_Error* error, void* user_arg) {
+  auto* ref = static_cast<AsyncExecuteRef*>(user_arg);
+  SetAsyncPjrtError(ref, error);
+  DestroyEvent(AsyncApi(ref), ref->waiting_event);
+  ref->waiting_event = nullptr;
+  napi_call_threadsafe_function(ref->ready, ref, napi_tsfn_nonblocking);
+}
+
+void OnAsyncJsReady(napi_env env, napi_value, void*, void* data) {
+  if (!env) return;
+  ContinueAsyncExecute(static_cast<AsyncExecuteRef*>(data));
+}
+
+bool WaitForPjrtEvent(AsyncExecuteRef* ref, PJRT_Event* event) {
+  if (!event) return false;
+
+  ref->waiting_event = event;
+  PJRT_Event_OnReady_Args args{
+      .struct_size = PJRT_Event_OnReady_Args_STRUCT_SIZE,
+      .extension_start = nullptr,
+      .event = event,
+      .callback = OnAsyncPjrtReady,
+      .user_arg = ref,
+  };
+  SetAsyncPjrtError(ref, AsyncApi(ref)->PJRT_Event_OnReady(&args));
+  if (!ref->error.empty()) {
+    DestroyEvent(AsyncApi(ref), ref->waiting_event);
+    ref->waiting_event = nullptr;
+  }
+  return ref->error.empty();
+}
+
+bool EnqueueAsyncInput(AsyncExecuteRef* ref) {
+  auto* client = ref->executable->client;
+  PJRT_Device* device = AsyncFirstAddressableDevice(ref);
+  if (!device) return false;
 
   PJRT_Client_BufferFromHostBuffer_Args args{
       .struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE,
       .extension_start = nullptr,
-      .client = ref->client,
-      .data = &value,
+      .client = client->client,
+      .data = &ref->input_value,
       .type = PJRT_Buffer_Type_F32,
       .dims = nullptr,
       .num_dims = 0,
@@ -306,53 +415,14 @@ PJRT_Buffer* BufferFromF32Scalar(napi_env env, ClientRef* ref, float value) {
       .memory = nullptr,
       .device_layout = nullptr,
   };
-  CheckPjrt(env, ref->library->api, ref->library->api->PJRT_Client_BufferFromHostBuffer(&args));
-  if (args.done_with_host_buffer) {
-    PJRT_Event_Await_Args await_args{
-        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-        .extension_start = nullptr,
-        .event = args.done_with_host_buffer,
-    };
-    CheckPjrt(env, ref->library->api, ref->library->api->PJRT_Event_Await(&await_args));
-    DestroyEvent(ref->library->api, args.done_with_host_buffer);
-  }
-  return args.buffer;
+  SetAsyncPjrtError(ref, AsyncApi(ref)->PJRT_Client_BufferFromHostBuffer(&args));
+  ref->input = args.buffer;
+  ref->step = AsyncExecuteStep::kAfterInput;
+  return ref->error.empty() && WaitForPjrtEvent(ref, args.done_with_host_buffer);
 }
 
-float F32ScalarFromBuffer(napi_env env, ClientRef* ref, PJRT_Buffer* buffer) {
-  size_t size = sizeof(float);
-  float result = NAN;
-  PJRT_Buffer_ToHostBuffer_Args args{
-      .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
-      .extension_start = nullptr,
-      .src = buffer,
-      .host_layout = nullptr,
-      .dst = &result,
-      .dst_size = size,
-  };
-  CheckPjrt(env, ref->library->api, ref->library->api->PJRT_Buffer_ToHostBuffer(&args));
-  if (args.event) {
-    PJRT_Event_Await_Args await_args{
-        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-        .extension_start = nullptr,
-        .event = args.event,
-    };
-    CheckPjrt(env, ref->library->api, ref->library->api->PJRT_Event_Await(&await_args));
-    DestroyEvent(ref->library->api, args.event);
-  }
-  return result;
-}
-
-napi_value ExecuteF32Scalar(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value args[2];
-  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-  auto* executable = External<ExecutableRef>(env, args[0]);
-  auto* client = executable->client;
-  PJRT_Buffer* input = BufferFromF32Scalar(env, client, static_cast<float>(NumberArg(env, args[1])));
-  if (!input) return nullptr;
-
-  PJRT_Buffer* input_list[] = {input};
+bool EnqueueAsyncExecution(AsyncExecuteRef* ref) {
+  PJRT_Buffer* input_list[] = {ref->input};
   PJRT_Buffer** argument_lists[] = {input_list};
   PJRT_Buffer* output_list[] = {nullptr};
   PJRT_Buffer** output_lists[] = {output_list};
@@ -361,10 +431,10 @@ napi_value ExecuteF32Scalar(napi_env env, napi_callback_info info) {
       .struct_size = PJRT_ExecuteOptions_STRUCT_SIZE,
       .extension_start = nullptr,
   };
-  PJRT_LoadedExecutable_Execute_Args execute_args{
+  PJRT_LoadedExecutable_Execute_Args args{
       .struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE,
       .extension_start = nullptr,
-      .executable = executable->executable,
+      .executable = ref->executable->executable,
       .options = &options,
       .argument_lists = argument_lists,
       .num_devices = 1,
@@ -372,29 +442,77 @@ napi_value ExecuteF32Scalar(napi_env env, napi_callback_info info) {
       .output_lists = output_lists,
       .device_complete_events = complete_events,
   };
-  CheckPjrt(env, client->library->api, client->library->api->PJRT_LoadedExecutable_Execute(&execute_args));
-  DestroyBuffer(client->library->api, input);
+  SetAsyncPjrtError(ref, AsyncApi(ref)->PJRT_LoadedExecutable_Execute(&args));
+  DestroyBuffer(AsyncApi(ref), ref->input);
+  ref->input = nullptr;
+  ref->output = output_list[0];
+  ref->step = AsyncExecuteStep::kAfterExecute;
+  return ref->error.empty() && WaitForPjrtEvent(ref, complete_events[0]);
+}
 
-  if (complete_events[0]) {
-    PJRT_Event_Await_Args await_args{
-        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-        .extension_start = nullptr,
-        .event = complete_events[0],
-    };
-    CheckPjrt(env, client->library->api, client->library->api->PJRT_Event_Await(&await_args));
-    DestroyEvent(client->library->api, complete_events[0]);
+bool EnqueueAsyncHostCopy(AsyncExecuteRef* ref) {
+  if (!ref->output) {
+    SetAsyncError(ref, "PJRT execution did not produce an output buffer");
+    return false;
   }
 
-  if (!output_list[0]) {
-    Throw(env, "PJRT execution did not produce an output buffer");
-    return nullptr;
+  PJRT_Buffer_ToHostBuffer_Args args{
+      .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
+      .extension_start = nullptr,
+      .src = ref->output,
+      .host_layout = nullptr,
+      .dst = &ref->result,
+      .dst_size = sizeof(ref->result),
+  };
+  SetAsyncPjrtError(ref, AsyncApi(ref)->PJRT_Buffer_ToHostBuffer(&args));
+  ref->step = AsyncExecuteStep::kAfterHostCopy;
+  return ref->error.empty() && WaitForPjrtEvent(ref, args.event);
+}
+
+void ContinueAsyncExecute(AsyncExecuteRef* ref) {
+  if (!ref->error.empty()) {
+    RejectAsyncExecute(ref);
+    return;
   }
 
-  float value = F32ScalarFromBuffer(env, client, output_list[0]);
-  DestroyBuffer(client->library->api, output_list[0]);
-  napi_value result;
-  napi_create_double(env, value, &result);
-  return result;
+  bool waiting = false;
+  if (ref->step == AsyncExecuteStep::kStart) waiting = EnqueueAsyncInput(ref);
+  if (!waiting && ref->error.empty() && ref->step == AsyncExecuteStep::kAfterInput)
+    waiting = EnqueueAsyncExecution(ref);
+  if (!waiting && ref->error.empty() && ref->step == AsyncExecuteStep::kAfterExecute)
+    waiting = EnqueueAsyncHostCopy(ref);
+  if (waiting) return;
+  if (!ref->error.empty()) {
+    RejectAsyncExecute(ref);
+    return;
+  }
+  ResolveAsyncExecute(ref);
+}
+
+napi_value ExecuteF32Scalar(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value args[2];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+  napi_value promise;
+  napi_deferred deferred;
+  napi_create_promise(env, &deferred, &promise);
+
+  auto* executable = External<ExecutableRef>(env, args[0]);
+  auto* ref = new AsyncExecuteRef{
+      .env = env,
+      .deferred = deferred,
+      .executable = executable,
+      .input_value = static_cast<float>(NumberArg(env, args[1])),
+  };
+  napi_create_reference(env, args[0], 1, &ref->executable_ref);
+
+  napi_value name;
+  napi_create_string_utf8(env, "PJRT executeF32Scalar", NAPI_AUTO_LENGTH, &name);
+  napi_create_threadsafe_function(env, nullptr, nullptr, name, 0, 1, nullptr, nullptr, nullptr,
+                                  OnAsyncJsReady, &ref->ready);
+  ContinueAsyncExecute(ref);
+  return promise;
 }
 
 napi_value Init(napi_env env, napi_value exports) {

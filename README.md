@@ -48,7 +48,7 @@ func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
 const client = new Client()
 const executable = client.compileMlir(mlir)
 
-console.log(executable.executeF32Scalar(41)) // 42
+console.log(await executable.executeF32Scalar(41)) // 42
 ```
 
 Pass a custom plugin path when the PJRT build is somewhere else:
@@ -71,4 +71,4 @@ This is a small first wrapper over PJRT:
 - executes one-output scalar programs
 - copies scalar `f32` outputs back to JavaScript
 
-Broader tensor shapes, more element types, async execution, richer compile options, and explicit resource disposal can be layered on top of this native binding.
+Broader tensor shapes, more element types, richer compile options, and explicit resource disposal can be layered on top of this native binding.

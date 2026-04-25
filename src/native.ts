@@ -11,7 +11,7 @@ type Native = {
   platformName(client: Handle): string
   deviceCount(client: Handle): number
   compile(client: Handle, code: string, format: string): Handle
-  executeF32Scalar(executable: Handle, input: number): number
+  executeF32Scalar(executable: Handle, input: number): Promise<number>
 }
 
 export {

@@ -17,8 +17,8 @@ test('creates a CPU PJRT client', () => {
   assert.equal(client.deviceCount, 2)
 })
 
-test('compiles and evaluates scalar f32 MLIR on CPU', () => {
+test('compiles and evaluates scalar f32 MLIR on CPU', async () => {
   const client = new Client()
   const executable = client.compileMlir(addOne)
-  assert.equal(executable.executeF32Scalar(41), 42)
+  assert.equal(await executable.executeF32Scalar(41), 42)
 })
