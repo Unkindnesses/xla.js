@@ -145,14 +145,14 @@ void DestroyBuffer(const PJRT_Api* api, PJRT_Buffer* buffer) {
   api->PJRT_Buffer_Destroy(&args);
 }
 
-napi_value ExternalValue(napi_env env, void* data, napi_finalize finalizer) {
+napi_value ExternalValue(napi_env env, void* data) {
   napi_value result;
-  napi_create_external(env, data, finalizer, nullptr, &result);
+  napi_create_external(env, data, nullptr, nullptr, &result);
   return result;
 }
 
-void FinalizeClient(napi_env, void* data, void*) {
-  auto* ref = static_cast<ClientRef*>(data);
+void FreeClientRef(ClientRef* ref) {
+  if (!ref) return;
   if (ref->client) {
     PJRT_Client_Destroy_Args args{
         .struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE,
@@ -162,12 +162,12 @@ void FinalizeClient(napi_env, void* data, void*) {
     ref->library->api->PJRT_Client_Destroy(&args);
   }
   if (ref->library->handle) dlclose(ref->library->handle);
-  delete ref->library;
-  delete ref;
+  ref->client = nullptr;
+  ref->library->handle = nullptr;
 }
 
-void FinalizeExecutable(napi_env, void* data, void*) {
-  auto* ref = static_cast<ExecutableRef*>(data);
+void FreeExecutableRef(ExecutableRef* ref) {
+  if (!ref) return;
   if (ref->executable) {
     PJRT_LoadedExecutable_Destroy_Args args{
         .struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE,
@@ -177,6 +177,20 @@ void FinalizeExecutable(napi_env, void* data, void*) {
     ref->client->library->api->PJRT_LoadedExecutable_Destroy(&args);
   }
   if (ref->client_ref) napi_delete_reference(ref->env, ref->client_ref);
+  ref->executable = nullptr;
+  ref->client_ref = nullptr;
+}
+
+void DeleteClientRef(napi_env, void* data, void*) {
+  auto* ref = static_cast<ClientRef*>(data);
+  FreeClientRef(ref);
+  delete ref->library;
+  delete ref;
+}
+
+void DeleteExecutableRef(napi_env, void* data, void*) {
+  auto* ref = static_cast<ExecutableRef*>(data);
+  FreeExecutableRef(ref);
   delete ref;
 }
 
@@ -233,7 +247,7 @@ napi_value CreateClient(napi_env env, napi_callback_info info) {
   }
 
   ref->client = create_args.client;
-  return ExternalValue(env, ref, FinalizeClient);
+  return ExternalValue(env, ref);
 }
 
 napi_value PlatformName(napi_env env, napi_callback_info info) {
@@ -303,7 +317,27 @@ napi_value Compile(napi_env env, napi_callback_info info) {
       .env = env,
   };
   napi_create_reference(env, args[0], 1, &executable->client_ref);
-  return ExternalValue(env, executable, FinalizeExecutable);
+  return ExternalValue(env, executable);
+}
+
+napi_value DisposeClient(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+  auto* ref = External<ClientRef>(env, args[0]);
+  DeleteClientRef(env, ref, nullptr);
+  return nullptr;
+}
+
+napi_value DisposeExecutable(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+  auto* ref = External<ExecutableRef>(env, args[0]);
+  DeleteExecutableRef(env, ref, nullptr);
+  return nullptr;
 }
 
 const PJRT_Api* AsyncApi(AsyncExecuteRef* ref) {
@@ -521,6 +555,9 @@ napi_value Init(napi_env env, napi_value exports) {
       {"platformName", nullptr, PlatformName, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"deviceCount", nullptr, DeviceCount, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"compile", nullptr, Compile, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"disposeClient", nullptr, DisposeClient, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"disposeExecutable", nullptr, DisposeExecutable, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
       {"executeF32Scalar", nullptr, ExecuteF32Scalar, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);

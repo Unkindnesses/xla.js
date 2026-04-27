@@ -72,6 +72,9 @@ const client = new Client({
 })
 ```
 
+Set `cpuDeviceCount` to expose more CPU devices. `Client` and `Executable`
+also provide explicit `.dispose()` methods for code that cannot use `using`.
+
 ## Current Scope
 
 This is a small first wrapper over PJRT:

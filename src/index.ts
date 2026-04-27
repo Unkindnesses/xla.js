@@ -33,7 +33,8 @@ function envCpuPluginPath() {
 }
 
 class Client {
-  #handle: Handle
+  #handle: Handle | null
+  #executables = new Set<Executable>()
 
   constructor(options: ClientOptions = {}) {
     const pluginPath = options.pluginPath ?? envCpuPluginPath()
@@ -41,25 +42,44 @@ class Client {
   }
 
   get platformName() {
-    return native.platformName(this.#handle)
+    return native.platformName(this.handle)
   }
 
   get deviceCount() {
-    return native.deviceCount(this.#handle)
+    return native.deviceCount(this.handle)
   }
 
   compileMlir(code: string) {
-    return new Executable(this, native.compile(this.#handle, code, 'mlir'))
+    const executable = new Executable(this, native.compile(this.handle, code, 'mlir'))
+    this.#executables.add(executable)
+    return executable
   }
 
   get handle() {
+    if (this.#handle === null) throw new ReferenceError('Client has been disposed')
     return this.#handle
+  }
+
+  dispose() {
+    const handle = this.#handle
+    if (handle === null) return
+    for (const executable of [...this.#executables]) executable.dispose()
+    native.disposeClient(handle)
+    this.#handle = null
+  }
+
+  [Symbol.dispose]() {
+    this.dispose()
+  }
+
+  _detach(executable: Executable) {
+    this.#executables.delete(executable)
   }
 }
 
 class Executable {
   #client: Client
-  #handle: Handle
+  #handle: Handle | null
 
   constructor(client: Client, handle: Handle) {
     this.#client = client
@@ -68,6 +88,23 @@ class Executable {
 
   executeF32Scalar(input: number) {
     void this.#client
-    return native.executeF32Scalar(this.#handle, input)
+    return native.executeF32Scalar(this.handle, input)
+  }
+
+  dispose() {
+    const handle = this.#handle
+    if (handle === null) return
+    native.disposeExecutable(handle)
+    this.#handle = null
+    this.#client._detach(this)
+  }
+
+  [Symbol.dispose]() {
+    this.dispose()
+  }
+
+  get handle() {
+    if (this.#handle === null) throw new ReferenceError('Executable has been disposed')
+    return this.#handle
   }
 }
